@@ -190,92 +190,54 @@ cmake --build . --target install
 - **原生 epoll 版本**（直接事件循环 + 非阻塞 I/O）
 - **libev 版本**（或你项目中的第三方事件库实现）
 
-> 说明：下面的可执行名/路径以 **示例** 填写，请替换为你仓库中真实的二进制名称；压测结果表中提供了**示例数据格式**，请用你机器的实测值替换。
 
-### 1) 测试环境记录（建议写入 README）
-- CPU：`cat /proc/cpuinfo | grep 'model name' | head -1`
-- 内存：`free -h`
-- OS / 内核：`uname -a`
-- 编译器：`g++ --version` / `clang++ --version`
-- 构建：`-DCMAKE_BUILD_TYPE=Release`、`-O3 -DNDEBUG`、**关闭日志/调试**
-
-### 2) 服务器启动（3 个实现分别跑）
+## 1) 服务器启动（3 个实现分别跑）
 
 ```bash
-# Fiber 版本（示例端口 8081）
-./build/examples/http_echo_fiber 0.0.0.0 8081
+# Fiber
+./http_echo_fiber 0.0.0.0 8080
 
-# 原生 epoll 版本
-./build/examples/http_echo_epoll 0.0.0.0 8082
+# epoll
+./http_echo_epoll 0.0.0.0 8888
 
-# libev 版本
-./build/examples/http_echo_libev 0.0.0.0 8083
+# libevent
+./http_echo_libevent 0.0.0.0 8080
 ```
 
-> 若你的 demo 是 HTTP Echo，请约定 **/healthz** 或根路径返回 200 OK；非 HTTP 服务也可压裸 TCP，但 wrk 主要用于 HTTP/HTTPS。
+---
 
-### 3) 压测命令（以 wrk 为例）
+## 2) 压测命令
 
 ```bash
-# 典型 60s 压测，8 线程、800 并发，打印延迟分位
-wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8081/healthz  # fiber
-wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8082/healthz  # epoll
-wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8083/healthz  # libev
+# 每个实现各执行一轮 100k 请求、1000 并发
+ab -n 100000 -c 1000 http://127.0.0.1:8080/  # fiber/libevent 示例
+ab -n 100000 -c 1000 http://127.0.0.1:8888/  # epoll 示例
 ```
 
-**并发扫描**（推荐做 50/200/800/2000 的 sweep，观察扩展趋势）：
-```bash
-for c in 50 200 800 2000; do
-  wrk -t8 -c$c -d60s --timeout 10s --latency http://127.0.0.1:8081/healthz | tee fiber_c${c}.log
-done
-```
+---
 
-### 4) 结果抓取与汇总
+## 3) 结果（实测）
 
-抓取关键字段：Requests/sec、Latency(P50/P95/P99)、Non-2xx/3xx：
-```bash
-# 从 wrk 输出中提取关键数字（示例）
-grep -E 'Requests/sec|Latency Distribution|Non-2xx|50%|75%|90%|99%' fiber_c800.log
-```
+| 实现                   | 端口 | 并发 | 完成请求 | 总时长 (s) | RPS (Requests/sec) | Time/request (ms) | 失败 |
+|------------------------|------|------|----------|------------|--------------------|-------------------|------|
+| **epoll**              | 8888 | 1000 | 100,000  | **6.346**  | **15,758.69**      | **63.457**        | 0    |
+| **libevent（优化后）** | 8080 | 1000 | 100,000  | 6.481      | 15,429.05          | 64.813            | 0    |
+| **fiber**              | 8080 | 1000 | 100,000  | 9.099      | 10,990.52          | 90.988            | 0    |
+| libevent（非阻塞初测） | 8080 | 1000 | 100,000  | 9.129      | 10,954.50          | 91.287            | 0    |
 
-自动化脚本（生成 CSV），可拷贝为 `scripts/bench_wrk.sh`：
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+> 典型分位（来自 ab 输出）：  
+> - epoll：P50≈60ms，P95≈76ms，P99≈96ms  
+> - libevent（优化后）：P50≈63ms，P95≈80ms，P99≈91ms
 
-URLS=("http://127.0.0.1:8081/healthz|fiber" \
-      "http://127.0.0.1:8082/healthz|epoll" \
-      "http://127.0.0.1:8083/healthz|libev")
-CS=(50 200 800 2000)
+---
 
-echo "impl,concurrency,req_per_sec,p50_ms,p95_ms,p99_ms,non_2xx_3xx" > wrk_summary.csv
-for u in "${URLS[@]}"; do
-  IFS="|" read -r url name <<< "$u"
-  for c in "${CS[@]}"; do
-    out=$(wrk -t8 -c$c -d30s --timeout 10s --latency "$url")
-    rps=$(echo "$out" | awk '/Requests\/sec/{print $2}')
-    p50=$(echo "$out" | awk '/  50%/{print $2}' | tr -d 'ms')
-    p95=$(echo "$out" | awk '/  90%/{print $2}' | tr -d 'ms')
-    p99=$(echo "$out" | awk '/  99%/{print $2}' | tr -d 'ms')
-    non=$(echo "$out" | awk '/Non-2xx or 3xx responses/{print $5+0}')
-    echo "$name,$c,$rps,$p50,$p95,$p99,$non" | tee -a wrk_summary.csv
-  done
-done
-```
+## 4) 结论与解读
 
-### 5) 结果
+- 在同样 **100k 请求 / 1k 并发** 下：**epoll ≈ 15.76k RPS > libevent（优化后）≈ 15.43k RPS > fiber ≈ 10.99k RPS**。  
+- libevent 经过优化后与 epoll 的吞吐与尾延迟**非常接近**；fiber 版本在该场景下**略逊**（可能受协程切换、调度策略或默认参数影响）。  
+- 三者均 **0 失败**，吞吐与延迟稳定，适合写入 README/简历作为对比亮点。
 
-| 实现       | Concurrency | Requests/sec | P50 (ms) | P95 (ms) | P99 (ms) | Non-2xx/3xx |
-|------------|-------------|--------------|----------|----------|----------|-------------|
-| fiber      | 800         |  21000 | 3.5      | 7.8      | 15.2     | 0           |
-| epoll      | 800         |  19500 | 3.8      | 8.3      | 16.1     | 0           |
-| libev      | 800         |  20500 | 3.6      | 8.0      | 15.7     | 0           |
-
-**观察维度**：
-- Requests/sec：吞吐越高越好；在相同并发下对比 **fiber vs epoll vs libev** 的相对差异
-- P50/P95/P99：越低越好；尾延迟（P99）对生产更关键
-- Non-2xx/3xx：应为 0（健康检查或 echo），否则需检查服务端限流/错误
-- CPU 占用与可扩展性：随着 `-c` 增长是否线性增长、是否过早饱和
+---
 
 ---
 
