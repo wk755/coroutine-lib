@@ -260,6 +260,4 @@ cmake --build . --target install
 
 ---
 
-## 📄 License
 
-Apache-2.0 / MIT（请按实际授权补充）。
