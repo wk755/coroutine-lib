@@ -216,15 +216,101 @@ cmake --build . --target install
 
 ---
 
-## ✅ 测试与基准
+## ⚡ 性能与压测（wrk）
 
-- **单元测试**：`ctest -V` 或 `make test`  
-- **回归示例**：`examples/*` 覆盖计时器、Channel、TCP Echo 等
-- **简单基准**（示意）：
-  - 协程上下文切换：构造 N producer/consumer 任务，统计切换次数/秒
-  - Echo 延迟/吞吐：`wrk -t4 -c200 -d30s http://127.0.0.1:9000`
+本节给出 **三种实现** 的压测流程与结果模板：
+- **Fiber 版本**（基于自研协程调度 + Reactor）
+- **原生 epoll 版本**（直接事件循环 + 非阻塞 I/O）
+- **libev 版本**（或你项目中的第三方事件库实现）
 
-> 注意：I/O 基准受系统参数影响（如 `ulimit -n`、`somaxconn`、Nagle/`TCP_NODELAY` 等）。
+> 说明：下面的可执行名/路径以 **示例** 填写，请替换为你仓库中真实的二进制名称；压测结果表中提供了**示例数据格式**，请用你机器的实测值替换。
+
+### 1) 测试环境记录（建议写入 README）
+- CPU：`cat /proc/cpuinfo | grep 'model name' | head -1`
+- 内存：`free -h`
+- OS / 内核：`uname -a`
+- 编译器：`g++ --version` / `clang++ --version`
+- 构建：`-DCMAKE_BUILD_TYPE=Release`、`-O3 -DNDEBUG`、**关闭日志/调试**
+
+### 2) 服务器启动（3 个实现分别跑）
+
+```bash
+# Fiber 版本（示例端口 8081）
+./build/examples/http_echo_fiber 0.0.0.0 8081
+
+# 原生 epoll 版本
+./build/examples/http_echo_epoll 0.0.0.0 8082
+
+# libev 版本
+./build/examples/http_echo_libev 0.0.0.0 8083
+```
+
+> 若你的 demo 是 HTTP Echo，请约定 **/healthz** 或根路径返回 200 OK；非 HTTP 服务也可压裸 TCP，但 wrk 主要用于 HTTP/HTTPS。
+
+### 3) 压测命令（以 wrk 为例）
+
+```bash
+# 典型 60s 压测，8 线程、800 并发，打印延迟分位
+wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8081/healthz  # fiber
+wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8082/healthz  # epoll
+wrk -t8 -c800 -d60s --timeout 10s --latency http://127.0.0.1:8083/healthz  # libev
+```
+
+**并发扫描**（推荐做 50/200/800/2000 的 sweep，观察扩展趋势）：
+```bash
+for c in 50 200 800 2000; do
+  wrk -t8 -c$c -d60s --timeout 10s --latency http://127.0.0.1:8081/healthz | tee fiber_c${c}.log
+done
+```
+
+### 4) 结果抓取与汇总
+
+抓取关键字段：Requests/sec、Latency(P50/P95/P99)、Non-2xx/3xx：
+```bash
+# 从 wrk 输出中提取关键数字（示例）
+grep -E 'Requests/sec|Latency Distribution|Non-2xx|50%|75%|90%|99%' fiber_c800.log
+```
+
+自动化脚本（生成 CSV），可拷贝为 `scripts/bench_wrk.sh`：
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+URLS=("http://127.0.0.1:8081/healthz|fiber" \
+      "http://127.0.0.1:8082/healthz|epoll" \
+      "http://127.0.0.1:8083/healthz|libev")
+CS=(50 200 800 2000)
+
+echo "impl,concurrency,req_per_sec,p50_ms,p95_ms,p99_ms,non_2xx_3xx" > wrk_summary.csv
+for u in "${URLS[@]}"; do
+  IFS="|" read -r url name <<< "$u"
+  for c in "${CS[@]}"; do
+    out=$(wrk -t8 -c$c -d30s --timeout 10s --latency "$url")
+    rps=$(echo "$out" | awk '/Requests\/sec/{print $2}')
+    p50=$(echo "$out" | awk '/  50%/{print $2}' | tr -d 'ms')
+    p95=$(echo "$out" | awk '/  90%/{print $2}' | tr -d 'ms')
+    p99=$(echo "$out" | awk '/  99%/{print $2}' | tr -d 'ms')
+    non=$(echo "$out" | awk '/Non-2xx or 3xx responses/{print $5+0}')
+    echo "$name,$c,$rps,$p50,$p95,$p99,$non" | tee -a wrk_summary.csv
+  done
+done
+```
+
+### 5) 结果（示例表格，请替换为实测）
+
+> **示例数据**仅为展示格式，不代表真实性能。请用你在相同硬件与参数下的实测值替换。
+
+| 实现       | Concurrency | Requests/sec | P50 (ms) | P95 (ms) | P99 (ms) | Non-2xx/3xx |
+|------------|-------------|--------------|----------|----------|----------|-------------|
+| fiber      | 800         | *[示例]* 21000 | 3.5      | 7.8      | 15.2     | 0           |
+| epoll      | 800         | *[示例]* 19500 | 3.8      | 8.3      | 16.1     | 0           |
+| libev      | 800         | *[示例]* 20500 | 3.6      | 8.0      | 15.7     | 0           |
+
+**观察维度**：
+- Requests/sec：吞吐越高越好；在相同并发下对比 **fiber vs epoll vs libev** 的相对差异
+- P50/P95/P99：越低越好；尾延迟（P99）对生产更关键
+- Non-2xx/3xx：应为 0（健康检查或 echo），否则需检查服务端限流/错误
+- CPU 占用与可扩展性：随着 `-c` 增长是否线性增长、是否过早饱和
 
 ---
 
